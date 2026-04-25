@@ -20,6 +20,7 @@ import * as db from './db.ts';
 import { validateSlug, contentHash, rowToPage, rowToChunk, rowToSearchResult, parseEmbedding, tryParseEmbedding } from './utils.ts';
 import { resolveBoostMap, resolveHardExcludes } from './search/source-boost.ts';
 import { buildSourceFactorCase, buildHardExcludeClause } from './search/sql-ranking.ts';
+import { tokenize, toTsQueryText } from './tokenizer.ts';
 
 export class PostgresEngine implements BrainEngine {
   readonly kind = 'postgres' as const;
@@ -231,6 +232,13 @@ export class PostgresEngine implements BrainEngine {
     if (opts?.limit && opts.limit > MAX_SEARCH_LIMIT) {
       console.warn(`[gbrain] Warning: search limit clamped from ${opts.limit} to ${MAX_SEARCH_LIMIT}`);
     }
+
+    // 应用层分词：将查询词分词后拼接为 tsquery
+    const tokens = await tokenize(query);
+    const tsQueryStr = toTsQueryText(tokens);
+
+    // 空查询保护
+    if (!tsQueryStr) return [];
 
     const detailLow = opts?.detail === 'low';
     // Fetch headroom for dedup: if we only fetch `limit` chunks, a cluster of

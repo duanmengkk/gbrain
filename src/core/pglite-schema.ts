@@ -74,7 +74,7 @@ CREATE TABLE IF NOT EXISTS content_chunks (
   chunk_index   INTEGER NOT NULL,
   chunk_text    TEXT    NOT NULL,
   chunk_source  TEXT    NOT NULL DEFAULT 'compiled_truth',
-  embedding     vector(1536),
+  embedding     vector(1024),
   model         TEXT    NOT NULL DEFAULT 'text-embedding-3-large',
   token_count   INTEGER,
   embedded_at   TIMESTAMPTZ,
@@ -200,8 +200,8 @@ CREATE TABLE IF NOT EXISTS config (
 INSERT INTO config (key, value) VALUES
   ('version', '1'),
   ('engine', 'pglite'),
-  ('embedding_model', 'text-embedding-3-large'),
-  ('embedding_dimensions', '1536'),
+  ('embedding_model', 'bge-m3'),
+  ('embedding_dimensions', '1024'),
   ('chunk_strategy', 'semantic')
 ON CONFLICT (key) DO NOTHING;
 
@@ -368,6 +368,11 @@ CREATE INDEX IF NOT EXISTS idx_cycle_locks_ttl ON gbrain_cycle_locks(ttl_expires
 -- ============================================================
 ALTER TABLE pages ADD COLUMN IF NOT EXISTS search_vector tsvector;
 
+-- 新增分词文本列，用于存储应用层分词后的文本
+ALTER TABLE pages ADD COLUMN IF NOT EXISTS segmented_title TEXT DEFAULT '';
+ALTER TABLE pages ADD COLUMN IF NOT EXISTS segmented_compiled_truth TEXT DEFAULT '';
+ALTER TABLE pages ADD COLUMN IF NOT EXISTS segmented_timeline TEXT DEFAULT '';
+
 CREATE INDEX IF NOT EXISTS idx_pages_search ON pages USING GIN(search_vector);
 
 CREATE OR REPLACE FUNCTION update_page_search_vector() RETURNS trigger AS $$
@@ -379,11 +384,12 @@ BEGIN
   FROM timeline_entries
   WHERE page_id = NEW.id;
 
+  -- 基于应用层分词后的文本生成 tsvector，使用 'simple' 配置
   NEW.search_vector :=
-    setweight(to_tsvector('english', coalesce(NEW.title, '')), 'A') ||
-    setweight(to_tsvector('english', coalesce(NEW.compiled_truth, '')), 'B') ||
-    setweight(to_tsvector('english', coalesce(NEW.timeline, '')), 'C') ||
-    setweight(to_tsvector('english', coalesce(timeline_text, '')), 'C');
+    setweight(to_tsvector('simple', coalesce(NEW.segmented_title, '')), 'A') ||
+    setweight(to_tsvector('simple', coalesce(NEW.segmented_compiled_truth, '')), 'B') ||
+    setweight(to_tsvector('simple', coalesce(NEW.segmented_timeline, '')), 'C') ||
+    setweight(to_tsvector('simple', coalesce(NEW.segmented_title || ' ' || NEW.segmented_compiled_truth, '')), 'B');
 
   RETURN NEW;
 END;

@@ -28,7 +28,7 @@
   },
   "scripts": {
     "dev": "bun run src/cli.ts",
-    "build": "bun build --compile --outfile bin/gbrain src/cli.ts",
+    "build": "bun build --compile --outfile bin/gbrain --external jieba-wasm src/cli.ts",
     "build:all": "bun build --compile --target=bun-darwin-arm64 --outfile bin/gbrain-darwin-arm64 src/cli.ts && bun build --compile --target=bun-linux-x64 --outfile bin/gbrain-linux-x64 src/cli.ts",
     "build:schema": "bash scripts/build-schema.sh",
     "build:llms": "bun run scripts/build-llms.ts",
@@ -54,6 +54,8 @@
     "@electric-sql/pglite": "0.4.3",
     "@modelcontextprotocol/sdk": "^1.0.0",
     "gray-matter": "^4.0.3",
+    "https-proxy-agent": "^9.0.0",
+    "jieba-wasm": "^2.4.0",
     "marked": "^18.0.0",
     "openai": "^4.0.0",
     "pgvector": "^0.2.0",

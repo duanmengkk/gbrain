@@ -22,6 +22,7 @@ import type {
 import { validateSlug, contentHash, rowToPage, rowToChunk, rowToSearchResult } from './utils.ts';
 import { resolveBoostMap, resolveHardExcludes } from './search/source-boost.ts';
 import { buildSourceFactorCase, buildHardExcludeClause } from './search/sql-ranking.ts';
+import { tokenize, toSegmentedText, toTsQueryText } from './tokenizer.ts';
 
 type PGLiteDB = PGlite;
 
@@ -131,6 +132,15 @@ export class PGLiteEngine implements BrainEngine {
     const hash = page.content_hash || contentHash(page);
     const frontmatter = page.frontmatter || {};
 
+    // 应用层分词：生成 segmented 文本
+    const titleTokens = await tokenize(page.title || '');
+    const compiledTruthTokens = await tokenize(page.compiled_truth || '');
+    const timelineTokens = await tokenize(page.timeline || '');
+
+    const segmentedTitle = toSegmentedText(titleTokens);
+    const segmentedCompiledTruth = toSegmentedText(compiledTruthTokens);
+    const segmentedTimeline = toSegmentedText(timelineTokens);
+
     // v0.18.0 Step 2: source_id relies on the schema DEFAULT 'default' so
     // existing callers still target the default source without threading
     // a parameter. ON CONFLICT target becomes (source_id, slug) since the
@@ -138,8 +148,9 @@ export class PGLiteEngine implements BrainEngine {
     // surface an explicit sourceId param on putPage for multi-source sync.
     const pageKind = page.page_kind || 'markdown';
     const { rows } = await this.db.query(
-      `INSERT INTO pages (slug, type, page_kind, title, compiled_truth, timeline, frontmatter, content_hash, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, now())
+      `INSERT INTO pages (slug, type, page_kind, title, compiled_truth, timeline, frontmatter, content_hash, updated_at,
+                           segmented_title, segmented_compiled_truth, segmented_timeline)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, now(), $9, $10, $11)
        ON CONFLICT (source_id, slug) DO UPDATE SET
          type = EXCLUDED.type,
          page_kind = EXCLUDED.page_kind,
@@ -148,9 +159,13 @@ export class PGLiteEngine implements BrainEngine {
          timeline = EXCLUDED.timeline,
          frontmatter = EXCLUDED.frontmatter,
          content_hash = EXCLUDED.content_hash,
-         updated_at = now()
+         updated_at = now(),
+         segmented_title = EXCLUDED.segmented_title,
+         segmented_compiled_truth = EXCLUDED.segmented_compiled_truth,
+         segmented_timeline = EXCLUDED.segmented_timeline
        RETURNING id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at`,
-      [slug, page.type, pageKind, page.title, page.compiled_truth, page.timeline || '', JSON.stringify(frontmatter), hash]
+      [slug, page.type, pageKind, page.title, page.compiled_truth, page.timeline || '', JSON.stringify(frontmatter), hash,
+          segmentedTitle, segmentedCompiledTruth, segmentedTimeline]
     );
     return rowToPage(rows[0] as Record<string, unknown>);
   }
@@ -238,6 +253,12 @@ export class PGLiteEngine implements BrainEngine {
       console.warn(`[gbrain] Warning: search limit clamped from ${opts.limit} to ${MAX_SEARCH_LIMIT}`);
     }
 
+      // 应用层分词：将查询词分词后拼接为 tsquery
+      const tokens = await tokenize(query);
+      const tsQueryStr = toTsQueryText(tokens);
+
+      // 空查询保护
+      if (!tsQueryStr) return [];
     // Fetch 3x to give dedup headroom, then page-dedup + re-limit.
     const innerLimit = Math.min(limit * 3, MAX_SEARCH_LIMIT * 3);
 
@@ -264,13 +285,13 @@ export class PGLiteEngine implements BrainEngine {
          SELECT
            p.slug, p.id as page_id, p.title, p.type, p.source_id,
            cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
-           ts_rank(cc.search_vector, websearch_to_tsquery('english', $1)) * ${sourceFactorCase} AS score,
+           ts_rank(cc.search_vector, websearch_to_tsquery('simple', $1)) * ${sourceFactorCase} AS score,
            CASE WHEN p.updated_at < (
              SELECT MAX(te.created_at) FROM timeline_entries te WHERE te.page_id = p.id
            ) THEN true ELSE false END AS stale
          FROM content_chunks cc
          JOIN pages p ON p.id = cc.page_id
-         WHERE cc.search_vector @@ websearch_to_tsquery('english', $1) ${detailFilter}${extraFilter} ${hardExcludeClause}
+         WHERE cc.search_vector @@ websearch_to_tsquery('simple', $1) ${detailFilter}${extraFilter} ${hardExcludeClause}
          ORDER BY score DESC
          LIMIT $2
        ),
