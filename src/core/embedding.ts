@@ -1,29 +1,40 @@
 /**
  * Embedding Service
- * Ported from production Ruby implementation (embedding_service.rb, 190 LOC)
- *
- * OpenAI text-embedding-3-large at 1536 dimensions.
+ * 
+ * bge-m3 embedding model via custom API endpoint.
  * Retry with exponential backoff (4s base, 120s cap, 5 retries).
  * 8000 character input truncation.
  */
 
-import OpenAI from 'openai';
+import { loadConfig } from './config.ts';
 
-const MODEL = 'text-embedding-3-large';
-const DIMENSIONS = 1536;
+const MODEL = 'bge-m3';
+const DIMENSIONS = 1024;
 const MAX_CHARS = 8000;
 const MAX_RETRIES = 5;
 const BASE_DELAY_MS = 4000;
 const MAX_DELAY_MS = 120000;
 const BATCH_SIZE = 100;
 
-let client: OpenAI | null = null;
+function getApiKey(): string {
+  const envKey = process.env.OPENAI_API_KEY;
+  if (envKey) return envKey;
+  const config = loadConfig();
+  return config?.openai_api_key || '';
+}
 
-function getClient(): OpenAI {
-  if (!client) {
-    client = new OpenAI();
-  }
-  return client;
+function getEmbeddingApiUrl(): string {
+  const envUrl = process.env.EMBEDDING_API_URL;
+  if (envUrl) return envUrl;
+  const config = loadConfig();
+  if (config?.embedding_api_url) return config.embedding_api_url;
+  throw new Error('EMBEDDING_API_URL not configured');
+}
+
+function getProxyUrl(): string | undefined {
+  return process.env.HTTPS_PROXY || process.env.https_proxy || 
+         process.env.HTTP_PROXY || process.env.http_proxy ||
+         process.env.ALL_PROXY || process.env.all_proxy;
 }
 
 export async function embed(text: string): Promise<Float32Array> {
@@ -33,11 +44,6 @@ export async function embed(text: string): Promise<Float32Array> {
 }
 
 export interface EmbedBatchOptions {
-  /**
-   * Optional callback fired after each 100-item sub-batch completes.
-   * CLI wrappers tick a reporter; Minion handlers can call
-   * job.updateProgress here instead of hooking the per-page callback.
-   */
   onBatchComplete?: (done: number, total: number) => void;
 }
 
@@ -48,7 +54,6 @@ export async function embedBatch(
   const truncated = texts.map(t => t.slice(0, MAX_CHARS));
   const results: Float32Array[] = [];
 
-  // Process in batches of BATCH_SIZE
   for (let i = 0; i < truncated.length; i += BATCH_SIZE) {
     const batch = truncated.slice(i, i + BATCH_SIZE);
     const batchResults = await embedBatchWithRetry(batch);
@@ -60,27 +65,39 @@ export async function embedBatch(
 }
 
 async function embedBatchWithRetry(texts: string[]): Promise<Float32Array[]> {
+  const apiUrl = getEmbeddingApiUrl();
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     try {
-      const response = await getClient().embeddings.create({
-        model: MODEL,
-        input: texts,
-        dimensions: DIMENSIONS,
+      const response = await fetch(apiUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${getApiKey()}`
+        },
+        body: JSON.stringify({
+          model: MODEL,
+          input: texts,
+          dimensions: DIMENSIONS
+        })
       });
 
-      // Sort by index to maintain order
-      const sorted = response.data.sort((a, b) => a.index - b.index);
-      return sorted.map(d => new Float32Array(d.embedding));
+      if (!response.ok) {
+        throw new Error(`Embedding API error: ${response.status} ${response.statusText}`);
+      }
+
+      const data = await response.json();
+      
+      const sorted = data.data.sort((a: { index: number }, b: { index: number }) => a.index - b.index);
+      return sorted.map((d: { embedding: number[] }) => new Float32Array(d.embedding));
     } catch (e: unknown) {
       if (attempt === MAX_RETRIES - 1) throw e;
 
-      // Check for rate limit with Retry-After header
       let delay = exponentialDelay(attempt);
 
-      if (e instanceof OpenAI.APIError && e.status === 429) {
-        const retryAfter = e.headers?.['retry-after'];
-        if (retryAfter) {
-          const parsed = parseInt(retryAfter, 10);
+      if (e instanceof Error && e.message.includes('429')) {
+        const match = e.message.match(/retry-after[:\s]*(\d+)/i);
+        if (match) {
+          const parsed = parseInt(match[1], 10);
           if (!isNaN(parsed)) {
             delay = parsed * 1000;
           }
@@ -91,7 +108,6 @@ async function embedBatchWithRetry(texts: string[]): Promise<Float32Array[]> {
     }
   }
 
-  // Should not reach here
   throw new Error('Embedding failed after all retries');
 }
 
