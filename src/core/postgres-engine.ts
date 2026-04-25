@@ -1,5 +1,5 @@
 import postgres from 'postgres';
-import type { BrainEngine, LinkBatchInput, TimelineBatchInput, ReservedConnection } from './engine.ts';
+import type { BrainEngine, LinkBatchInput, TimelineBatchInput } from './engine.ts';
 import { MAX_SEARCH_LIMIT, clampSearchLimit } from './engine.ts';
 import { runMigrations } from './migrate.ts';
 import { SCHEMA_SQL } from './schema-embedded.ts';
@@ -18,6 +18,7 @@ import type {
 import { GBrainError } from './types.ts';
 import * as db from './db.ts';
 import { validateSlug, contentHash, rowToPage, rowToChunk, rowToSearchResult, parseEmbedding, tryParseEmbedding } from './utils.ts';
+import { tokenize, toTsQueryText } from './tokenizer.ts';
 
 export class PostgresEngine implements BrainEngine {
   readonly kind = 'postgres' as const;
@@ -54,7 +55,6 @@ export class PostgresEngine implements BrainEngine {
       }
       this._sql = postgres(url, opts);
       await this._sql`SELECT 1`;
-      await db.setSessionDefaults(this._sql);
     } else {
       // Module-level singleton (backward compat for CLI main engine)
       await db.connect(config);
@@ -97,24 +97,6 @@ export class PostgresEngine implements BrainEngine {
       Object.defineProperty(txEngine, '_sql', { value: tx as unknown as ReturnType<typeof postgres>, writable: false });
       return fn(txEngine);
     }) as Promise<T>;
-  }
-
-  async withReservedConnection<T>(fn: (conn: ReservedConnection) => Promise<T>): Promise<T> {
-    const pool = this._sql || db.getConnection();
-    const reserved = await pool.reserve();
-    try {
-      const conn: ReservedConnection = {
-        async executeRaw<R = Record<string, unknown>>(query: string, params?: unknown[]): Promise<R[]> {
-          const rows = params === undefined
-            ? await reserved.unsafe(query)
-            : await reserved.unsafe(query, params as Parameters<typeof reserved.unsafe>[1]);
-          return rows as unknown as R[];
-        },
-      };
-      return await fn(conn);
-    } finally {
-      reserved.release();
-    }
   }
 
   // Pages CRUD
@@ -221,6 +203,13 @@ export class PostgresEngine implements BrainEngine {
       console.warn(`[gbrain] Warning: search limit clamped from ${opts.limit} to ${MAX_SEARCH_LIMIT}`);
     }
 
+    // 应用层分词：将查询词分词后拼接为 tsquery
+    const tokens = await tokenize(query);
+    const tsQueryStr = toTsQueryText(tokens);
+
+    // 空查询保护
+    if (!tsQueryStr) return [];
+
     const detailLow = opts?.detail === 'low';
 
     // Search-only timeout: prevents DoS via expensive queries without
@@ -237,9 +226,9 @@ export class PostgresEngine implements BrainEngine {
       return await sql`
         WITH ranked_pages AS (
           SELECT p.id, p.slug, p.title, p.type,
-            ts_rank(p.search_vector, websearch_to_tsquery('english', ${query})) AS score
+            ts_rank(p.search_vector, to_tsquery('simple', ${tsQueryStr})) AS score
           FROM pages p
-          WHERE p.search_vector @@ websearch_to_tsquery('english', ${query})
+          WHERE p.search_vector @@ to_tsquery('simple', ${tsQueryStr})
             ${type ? sql`AND p.type = ${type}` : sql``}
             ${excludeSlugs?.length ? sql`AND p.slug != ALL(${excludeSlugs})` : sql``}
           ORDER BY score DESC

@@ -2,7 +2,7 @@ import { PGlite } from '@electric-sql/pglite';
 import { vector } from '@electric-sql/pglite/vector';
 import { pg_trgm } from '@electric-sql/pglite/contrib/pg_trgm';
 import type { Transaction } from '@electric-sql/pglite';
-import type { BrainEngine, LinkBatchInput, TimelineBatchInput, ReservedConnection } from './engine.ts';
+import type { BrainEngine, LinkBatchInput, TimelineBatchInput } from './engine.ts';
 import { MAX_SEARCH_LIMIT, clampSearchLimit } from './engine.ts';
 import { runMigrations } from './migrate.ts';
 import { PGLITE_SCHEMA_SQL } from './pglite-schema.ts';
@@ -20,6 +20,7 @@ import type {
   EngineConfig,
 } from './types.ts';
 import { validateSlug, contentHash, rowToPage, rowToChunk, rowToSearchResult } from './utils.ts';
+import { tokenize, toSegmentedText, toTsQueryText } from './tokenizer.ts';
 
 type PGLiteDB = PGlite;
 
@@ -92,19 +93,6 @@ export class PGLiteEngine implements BrainEngine {
     }
   }
 
-  async withReservedConnection<T>(fn: (conn: ReservedConnection) => Promise<T>): Promise<T> {
-    // PGLite has no connection pool. The single backing connection is
-    // always effectively reserved — pass it through.
-    const db = this.db;
-    const conn: ReservedConnection = {
-      async executeRaw<R = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<R[]> {
-        const { rows } = await db.query(sql, params);
-        return rows as R[];
-      },
-    };
-    return fn(conn);
-  }
-
   async transaction<T>(fn: (engine: BrainEngine) => Promise<T>): Promise<T> {
     return this.db.transaction(async (tx) => {
       const txEngine = Object.create(this) as PGLiteEngine;
@@ -129,14 +117,24 @@ export class PGLiteEngine implements BrainEngine {
     const hash = page.content_hash || contentHash(page);
     const frontmatter = page.frontmatter || {};
 
+    // 应用层分词：生成 segmented 文本
+    const titleTokens = await tokenize(page.title || '');
+    const compiledTruthTokens = await tokenize(page.compiled_truth || '');
+    const timelineTokens = await tokenize(page.timeline || '');
+
+    const segmentedTitle = toSegmentedText(titleTokens);
+    const segmentedCompiledTruth = toSegmentedText(compiledTruthTokens);
+    const segmentedTimeline = toSegmentedText(timelineTokens);
+
     // v0.18.0 Step 2: source_id relies on the schema DEFAULT 'default' so
     // existing callers still target the default source without threading
     // a parameter. ON CONFLICT target becomes (source_id, slug) since the
     // global UNIQUE(slug) was dropped in migration v17. Step 5+ will
     // surface an explicit sourceId param on putPage for multi-source sync.
     const { rows } = await this.db.query(
-      `INSERT INTO pages (slug, type, title, compiled_truth, timeline, frontmatter, content_hash, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, now())
+      `INSERT INTO pages (slug, type, title, compiled_truth, timeline, frontmatter, content_hash, updated_at,
+                           segmented_title, segmented_compiled_truth, segmented_timeline)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, now(), $8, $9, $10)
        ON CONFLICT (source_id, slug) DO UPDATE SET
          type = EXCLUDED.type,
          title = EXCLUDED.title,
@@ -144,9 +142,13 @@ export class PGLiteEngine implements BrainEngine {
          timeline = EXCLUDED.timeline,
          frontmatter = EXCLUDED.frontmatter,
          content_hash = EXCLUDED.content_hash,
-         updated_at = now()
+         updated_at = now(),
+         segmented_title = EXCLUDED.segmented_title,
+         segmented_compiled_truth = EXCLUDED.segmented_compiled_truth,
+         segmented_timeline = EXCLUDED.segmented_timeline
        RETURNING id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at`,
-      [slug, page.type, page.title, page.compiled_truth, page.timeline || '', JSON.stringify(frontmatter), hash]
+      [slug, page.type, page.title, page.compiled_truth, page.timeline || '', JSON.stringify(frontmatter), hash,
+       segmentedTitle, segmentedCompiledTruth, segmentedTimeline]
     );
     return rowToPage(rows[0] as Record<string, unknown>);
   }
@@ -221,21 +223,28 @@ export class PGLiteEngine implements BrainEngine {
       console.warn(`[gbrain] Warning: search limit clamped from ${opts.limit} to ${MAX_SEARCH_LIMIT}`);
     }
 
+    // 应用层分词：将查询词分词后拼接为 tsquery
+    const tokens = await tokenize(query);
+    const tsQueryStr = toTsQueryText(tokens);
+
+    // 空查询保护
+    if (!tsQueryStr) return [];
+
     const { rows } = await this.db.query(
       `SELECT
         p.slug, p.id as page_id, p.title, p.type, p.source_id,
         cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
-        ts_rank(p.search_vector, websearch_to_tsquery('english', $1)) AS score,
+        ts_rank(p.search_vector, to_tsquery('simple', $1)) AS score,
         CASE WHEN p.updated_at < (
           SELECT MAX(te.created_at) FROM timeline_entries te WHERE te.page_id = p.id
         ) THEN true ELSE false END AS stale
       FROM pages p
       JOIN content_chunks cc ON cc.page_id = p.id
-      WHERE p.search_vector @@ websearch_to_tsquery('english', $1) ${detailFilter}
+      WHERE p.search_vector @@ to_tsquery('simple', $1) ${detailFilter}
       ORDER BY score DESC
       LIMIT $2
       OFFSET $3`,
-      [query, limit, offset]
+      [tsQueryStr, limit, offset]
     );
 
     return (rows as Record<string, unknown>[]).map(rowToSearchResult);
