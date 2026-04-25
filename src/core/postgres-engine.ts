@@ -18,6 +18,7 @@ import type {
 import { GBrainError } from './types.ts';
 import * as db from './db.ts';
 import { validateSlug, contentHash, rowToPage, rowToChunk, rowToSearchResult, parseEmbedding, tryParseEmbedding } from './utils.ts';
+import { tokenize, toTsQueryText } from './tokenizer.ts';
 
 export class PostgresEngine implements BrainEngine {
   readonly kind = 'postgres' as const;
@@ -221,6 +222,13 @@ export class PostgresEngine implements BrainEngine {
       console.warn(`[gbrain] Warning: search limit clamped from ${opts.limit} to ${MAX_SEARCH_LIMIT}`);
     }
 
+    // 应用层分词：将查询词分词后拼接为 tsquery
+    const tokens = await tokenize(query);
+    const tsQueryStr = toTsQueryText(tokens);
+
+    // 空查询保护
+    if (!tsQueryStr) return [];
+
     const detailLow = opts?.detail === 'low';
 
     // Search-only timeout: prevents DoS via expensive queries without
@@ -237,9 +245,9 @@ export class PostgresEngine implements BrainEngine {
       return await sql`
         WITH ranked_pages AS (
           SELECT p.id, p.slug, p.title, p.type,
-            ts_rank(p.search_vector, websearch_to_tsquery('english', ${query})) AS score
+            ts_rank(p.search_vector, to_tsquery('simple', ${tsQueryStr})) AS score
           FROM pages p
-          WHERE p.search_vector @@ websearch_to_tsquery('english', ${query})
+          WHERE p.search_vector @@ to_tsquery('simple', ${tsQueryStr})
             ${type ? sql`AND p.type = ${type}` : sql``}
             ${excludeSlugs?.length ? sql`AND p.slug != ALL(${excludeSlugs})` : sql``}
           ORDER BY score DESC

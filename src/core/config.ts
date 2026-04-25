@@ -29,6 +29,7 @@ export interface GBrainConfig {
   database_path?: string;
   openai_api_key?: string;
   anthropic_api_key?: string;
+  embedding_api_url?: string;
   /**
    * Optional storage backend config (S3/Supabase/local). Shape matches
    * `StorageConfig` in `./storage.ts`. Typed as `unknown` here to avoid
@@ -64,6 +65,7 @@ export function loadConfig(): GBrainConfig | null {
     engine: inferredEngine,
     ...(dbUrl ? { database_url: dbUrl } : {}),
     ...(process.env.OPENAI_API_KEY ? { openai_api_key: process.env.OPENAI_API_KEY } : {}),
+    ...(process.env.EMBEDDING_API_URL ? { embedding_api_url: process.env.EMBEDDING_API_URL } : {}),
   };
   return merged as GBrainConfig;
 }
