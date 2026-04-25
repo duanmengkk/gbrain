@@ -16,7 +16,15 @@ const BASE_DELAY_MS = 4000;
 const MAX_DELAY_MS = 120000;
 const BATCH_SIZE = 100;
 
-const EMBEDDING_API_URL = 'https://zhenze-huhehaote.cmecloud.cn/v1/embeddings';
+function getEmbeddingApiUrl(): string {
+  const envUrl = process.env.GBRAIN_EMBEDDING_API_URL;
+  if (envUrl) return envUrl;
+  const config = loadConfig();
+  if (!config?.embedding_api_url) {
+    throw new Error('Embedding API URL not configured. Set GBRAIN_EMBEDDING_API_URL env var or embedding_api_url in config.');
+  }
+  return config.embedding_api_url;
+}
 
 function getApiKey(): string {
   const envKey = process.env.OPENAI_API_KEY;
@@ -61,7 +69,7 @@ export async function embedBatch(
 async function embedBatchWithRetry(texts: string[]): Promise<Float32Array[]> {
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     try {
-      const response = await fetch(EMBEDDING_API_URL, {
+      const response = await fetch(getEmbeddingApiUrl(), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
