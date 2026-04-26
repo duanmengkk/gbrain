@@ -20,6 +20,7 @@ import * as db from './db.ts';
 import { validateSlug, contentHash, rowToPage, rowToChunk, rowToSearchResult, parseEmbedding, tryParseEmbedding } from './utils.ts';
 import { resolveBoostMap, resolveHardExcludes } from './search/source-boost.ts';
 import { buildSourceFactorCase, buildHardExcludeClause } from './search/sql-ranking.ts';
+import { tokenize, toTsQueryText } from './tokenizer.ts';
 
 export class PostgresEngine implements BrainEngine {
   readonly kind = 'postgres' as const;
@@ -232,6 +233,13 @@ export class PostgresEngine implements BrainEngine {
       console.warn(`[gbrain] Warning: search limit clamped from ${opts.limit} to ${MAX_SEARCH_LIMIT}`);
     }
 
+    // 应用层分词：将查询词分词后拼接为 tsquery
+    const tokens = await tokenize(query);
+    const tsQueryStr = toTsQueryText(tokens);
+
+    // 空查询保护
+    if (!tsQueryStr) return [];
+
     const detailLow = opts?.detail === 'low';
     // Fetch headroom for dedup: if we only fetch `limit` chunks, a cluster of
     // co-occurring terms in one page can eat the entire result set and we'd
@@ -314,6 +322,7 @@ export class PostgresEngine implements BrainEngine {
     // to the transaction so it can never leak onto a pooled connection.
     const rows = await sql.begin(async sql => {
       await sql`SET LOCAL statement_timeout = '8s'`;
+<<<<<<< HEAD
       return await sql.unsafe(rawQuery, params as Parameters<typeof sql.unsafe>[1]);
     });
     return rows.map(rowToSearchResult);
@@ -400,6 +409,35 @@ export class PostgresEngine implements BrainEngine {
     const rows = await sql.begin(async sql => {
       await sql`SET LOCAL statement_timeout = '8s'`;
       return await sql.unsafe(rawQuery, params as Parameters<typeof sql.unsafe>[1]);
+=======
+      // CTE: rank pages by FTS score, then pick the best chunk per page in SQL
+      return await sql`
+        WITH ranked_pages AS (
+          SELECT p.id, p.slug, p.title, p.type,
+            ts_rank(p.search_vector, to_tsquery('simple', ${tsQueryStr})) AS score
+          FROM pages p
+          WHERE p.search_vector @@ to_tsquery('simple', ${tsQueryStr})
+            ${type ? sql`AND p.type = ${type}` : sql``}
+            ${excludeSlugs?.length ? sql`AND p.slug != ALL(${excludeSlugs})` : sql``}
+          ORDER BY score DESC
+          LIMIT ${limit}
+          OFFSET ${offset}
+        ),
+        best_chunks AS (
+          SELECT DISTINCT ON (rp.slug)
+            rp.slug, rp.id as page_id, rp.title, rp.type, rp.score,
+            cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source
+          FROM ranked_pages rp
+          JOIN content_chunks cc ON cc.page_id = rp.id
+          ${detailLow ? sql`WHERE cc.chunk_source = 'compiled_truth'` : sql``}
+          ORDER BY rp.slug, cc.chunk_index
+        )
+        SELECT slug, page_id, title, type, chunk_id, chunk_index, chunk_text, chunk_source, score,
+          false AS stale
+        FROM best_chunks
+        ORDER BY score DESC
+      `;
+>>>>>>> c3c10c4 (feat: add Chinese segmentation (jieba-wasm) and switch to bge-m3 embedding)
     });
     return rows.map(rowToSearchResult);
   }
