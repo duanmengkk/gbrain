@@ -66,7 +66,12 @@ CREATE TABLE IF NOT EXISTS pages (
   content_hash  TEXT,
   created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-  CONSTRAINT pages_source_slug_key UNIQUE (source_id, slug)
+  CONSTRAINT pages_source_slug_key UNIQUE (source_id, slug),
+
+  -- 中文分词列（应用层分词，trigger 使用 segmented_* 生成 search_vector）
+  segmented_title          TEXT NOT NULL DEFAULT '',
+  segmented_compiled_truth TEXT NOT NULL DEFAULT '',
+  segmented_timeline       TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_pages_type ON pages(type);
@@ -314,7 +319,8 @@ ALTER TABLE pages ADD COLUMN IF NOT EXISTS search_vector tsvector;
 CREATE INDEX IF NOT EXISTS idx_pages_search ON pages USING GIN(search_vector);
 
 -- Function to rebuild search_vector for a page
-CREATE OR REPLACE FUNCTION update_page_search_vector() RETURNS trigger AS \$\$
+-- 使用 'simple' 配置 + 应用层分词的 segmented_* 列，支持中文搜索
+CREATE OR REPLACE FUNCTION update_page_search_vector() RETURNS trigger AS $$
 DECLARE
   timeline_text TEXT;
 BEGIN
@@ -324,16 +330,18 @@ BEGIN
   FROM timeline_entries
   WHERE page_id = NEW.id;
 
-  -- Build weighted tsvector
+  -- Build weighted tsvector using 'simple' config with pre-segmented text
+  -- segmented_* 列由应用层（putPage）使用 jieba-wasm 分词后填充
   NEW.search_vector :=
-    setweight(to_tsvector('english', coalesce(NEW.title, '')), 'A') ||
-    setweight(to_tsvector('english', coalesce(NEW.compiled_truth, '')), 'B') ||
-    setweight(to_tsvector('english', coalesce(NEW.timeline, '')), 'C') ||
-    setweight(to_tsvector('english', coalesce(timeline_text, '')), 'C');
+    setweight(to_tsvector('simple', coalesce(NEW.segmented_title, '')), 'A') ||
+    setweight(to_tsvector('simple', coalesce(NEW.segmented_compiled_truth, '')), 'B') ||
+    setweight(to_tsvector('simple', coalesce(NEW.segmented_timeline, '')), 'C') ||
+    setweight(to_tsvector('simple', coalesce(NEW.segmented_title || ' ' || NEW.segmented_compiled_truth, '')), 'B') ||
+    setweight(to_tsvector('simple', coalesce(timeline_text, '')), 'C');
 
   RETURN NEW;
 END;
-\$\$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql;
 
 DROP TRIGGER IF EXISTS trg_pages_search_vector ON pages;
 CREATE TRIGGER trg_pages_search_vector

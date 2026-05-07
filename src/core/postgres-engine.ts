@@ -18,7 +18,7 @@ import type {
 import { GBrainError } from './types.ts';
 import * as db from './db.ts';
 import { validateSlug, contentHash, rowToPage, rowToChunk, rowToSearchResult, parseEmbedding, tryParseEmbedding } from './utils.ts';
-import { tokenize, toTsQueryText } from './tokenizer.ts';
+import { tokenize, toSegmentedText, toTsQueryText } from './tokenizer.ts';
 
 export class PostgresEngine implements BrainEngine {
   readonly kind = 'postgres' as const;
@@ -135,13 +135,24 @@ export class PostgresEngine implements BrainEngine {
     const hash = page.content_hash || contentHash(page);
     const frontmatter = page.frontmatter || {};
 
+    // 应用层分词：生成 segmented 文本用于中文搜索
+    const titleTokens = await tokenize(page.title || '');
+    const compiledTruthTokens = await tokenize(page.compiled_truth || '');
+    const timelineTokens = await tokenize(page.timeline || '');
+
+    const segmentedTitle = toSegmentedText(titleTokens);
+    const segmentedCompiledTruth = toSegmentedText(compiledTruthTokens);
+    const segmentedTimeline = toSegmentedText(timelineTokens);
+
     // v0.18.0 Step 2: source_id relies on schema DEFAULT 'default'. ON
     // CONFLICT target becomes (source_id, slug) since global UNIQUE(slug)
     // was dropped in migration v17. See pglite-engine.ts for matching
     // notes; multi-source sync (Step 5) will surface an explicit sourceId.
     const rows = await sql`
-      INSERT INTO pages (slug, type, title, compiled_truth, timeline, frontmatter, content_hash, updated_at)
-      VALUES (${slug}, ${page.type}, ${page.title}, ${page.compiled_truth}, ${page.timeline || ''}, ${sql.json(frontmatter as Parameters<typeof sql.json>[0])}, ${hash}, now())
+      INSERT INTO pages (slug, type, title, compiled_truth, timeline, frontmatter, content_hash, updated_at,
+                         segmented_title, segmented_compiled_truth, segmented_timeline)
+      VALUES (${slug}, ${page.type}, ${page.title}, ${page.compiled_truth}, ${page.timeline || ''}, ${sql.json(frontmatter as Parameters<typeof sql.json>[0])}, ${hash}, now(),
+              ${segmentedTitle}, ${segmentedCompiledTruth}, ${segmentedTimeline})
       ON CONFLICT (source_id, slug) DO UPDATE SET
         type = EXCLUDED.type,
         title = EXCLUDED.title,
@@ -149,7 +160,10 @@ export class PostgresEngine implements BrainEngine {
         timeline = EXCLUDED.timeline,
         frontmatter = EXCLUDED.frontmatter,
         content_hash = EXCLUDED.content_hash,
-        updated_at = now()
+        updated_at = now(),
+        segmented_title = EXCLUDED.segmented_title,
+        segmented_compiled_truth = EXCLUDED.segmented_compiled_truth,
+        segmented_timeline = EXCLUDED.segmented_timeline
       RETURNING id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at
     `;
     return rowToPage(rows[0]);
