@@ -265,9 +265,86 @@ bin/
 - 从 Windows 只能编译 Windows 版本
 - 如需多平台构建，建议使用 CI/CD（如 GitHub Actions）
 
+#### macOS 编译
+
+```bash
+# Apple Silicon (M1/M2/M3/M4)
+bun build --compile --target=bun-darwin-arm64 --outfile bin/gbrain-darwin-arm64 src/cli.ts
+
+# Intel Mac
+bun build --compile --target=bun-darwin-x64 --outfile bin/gbrain-darwin-x64 src/cli.ts
+```
+
+#### Windows 编译
+
+```bash
+# Windows x64
+bun build --compile --target=bun-windows-x64 --outfile bin/gbrain-windows-x64.exe src/cli.ts
+```
+
+#### Linux 编译
+
+```bash
+# Linux x64
+bun build --compile --target=bun-linux-x64 --outfile bin/gbrain-linux-x64 src/cli.ts
+
+# Linux ARM64
+bun build --compile --target=bun-linux-arm64 --outfile bin/gbrain-linux-arm64 src/cli.ts
+```
+
 ### 5.4 数据库更新
 
 执行数据库更新脚本（见上方 4.1-4.3）
+
+### 5.5 完整编译流程（从零开始）
+
+```bash
+# 1. 克隆源码
+git clone https://github.com/garrytan/gbrain ~/gbrain
+cd ~/gbrain
+
+# 2. 安装依赖
+bun install
+
+# 3. 添加 jieba-wasm 依赖（用于生成 WASM 嵌入文件）
+bun add jieba-wasm
+
+# 4. 编译（会自动运行 prebuild 嵌入 WASM）
+bun run build
+
+# 5. 输出产物
+ls -lh bin/
+# bin/gbrain (~67MB，自包含二进制)
+```
+
+### 5.6 安装编译好的二进制
+
+```bash
+# 方式1：安装到 ~/bin
+mkdir -p ~/bin
+cp bin/gbrain-darwin-arm64 ~/bin/gbrain
+chmod +x ~/bin/gbrain
+
+# 方式2：安装到系统目录（需要 sudo）
+sudo cp bin/gbrain-darwin-arm64 /usr/local/bin/gbrain
+
+# 添加 PATH（如果使用方式1）
+echo 'export PATH=$HOME/bin:$PATH' >> ~/.zshrc
+source ~/.zshrc
+
+# 验证
+gbrain --version
+```
+
+### 5.7 初始化数据库
+
+```bash
+# PostgreSQL
+gbrain init --url 'postgresql://postgres:<password>@<host>:5432/gbrain'
+
+# 或 PGLite（本地文件）
+gbrain init
+```
 
 ---
 
