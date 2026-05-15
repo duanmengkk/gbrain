@@ -28,8 +28,11 @@
   },
   "scripts": {
     "dev": "bun run src/cli.ts",
-    "build": "bun build --compile --outfile bin/gbrain --external jieba-wasm src/cli.ts",
-    "build:all": "bun build --compile --target=bun-darwin-arm64 --outfile bin/gbrain-darwin-arm64 src/cli.ts && bun build --compile --target=bun-linux-x64 --outfile bin/gbrain-linux-x64 src/cli.ts",
+    "prebuild": "bun run scripts/embed-wasm.ts",
+    "build": "bun build --compile --outfile bin/gbrain src/cli.ts",
+    "build:mac": "bun build --compile --target=bun-darwin-arm64 --outfile bin/gbrain-darwin-arm64 src/cli.ts && bun build --compile --target=bun-darwin-x64 --outfile bin/gbrain-darwin-x64 src/cli.ts",
+    "build:win": "bun build --compile --target=bun-windows-x64 --outfile bin/gbrain-windows-x64.exe src/cli.ts",
+    "build:all": "bun run build:mac && bun run build:win",
     "build:schema": "bash scripts/build-schema.sh",
     "build:llms": "bun run scripts/build-llms.ts",
     "test": "scripts/check-jsonb-pattern.sh && scripts/check-progress-to-stdout.sh && bun run typecheck && bun test",

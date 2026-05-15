@@ -60,26 +60,48 @@
 | 文件 | 说明 |
 |------|------|
 | `src/core/tokenizer.ts` | 中文分词模块，使用 jieba-wasm |
+| `scripts/embed-wasm.ts` | 构建脚本，将 WASM 文件转 base64 嵌入代码 |
+| `src/core/jieba-wasm-embedded.ts` | 自动生成的 WASM base64 数据（约 5MB） |
 
 ### 3.2 修改文件
 
 | 文件 | 修改内容 |
 |------|---------|
-| `package.json` | 添加 jieba-wasm 依赖，修改 build 脚本 |
+| `package.json` | 添加 jieba-wasm 依赖，修改 build 脚本，添加 prebuild |
+| `src/core/tokenizer.ts` | 使用内嵌 WASM 初始化 |
 | `src/core/pglite-schema.ts` | 新增 segmented_* 列，trigger 改用 'simple' |
 | `src/core/pglite-engine.ts` | 写入时分词填充 segmented 列，搜索时分词 |
 | `src/core/postgres-engine.ts` | 搜索时分词 |
 | `src/core/embedding.ts` | 向量模型改为 bge-m3 |
 | `src/core/schema-embedded.ts` | 向量维度改为 1024 |
+| `.gitignore` | 添加生成的嵌入文件 |
 
 ### 3.3 详细修改
 
 #### 3.3.1 tokenizer.ts（新文件）
 
 ```typescript
-import { cut_for_search } from 'jieba-wasm';
+import init, { cut_for_search } from 'jieba-wasm/web';
+import { getJiebaWasmBytes } from './jieba-wasm-embedded';
+
+let initialized = false;
+
+async function ensureInitialized() {
+  if (!initialized) {
+    const wasmBytes = getJiebaWasmBytes();
+    const blob = new Blob([wasmBytes], { type: 'application/wasm' });
+    const url = URL.createObjectURL(blob);
+    try {
+      await init({ module_or_path: url });
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+    initialized = true;
+  }
+}
 
 export async function tokenize(text: string): Promise<string[]> {
+  await ensureInitialized();
   return cut_for_search(text, true)
     .filter(w => w.trim() && !/^\p{P}+$/u.test(w));
 }
@@ -92,6 +114,12 @@ export function toTsQueryText(tokens: string[]): string {
   return tokens.filter(w => w.trim()).join(' & ');
 }
 ```
+
+**构建流程**：
+1. `prebuild` 脚本自动运行 `scripts/embed-wasm.ts`
+2. 将 WASM 文件转为 base64 存入 `src/core/jieba-wasm-embedded.ts`
+3. 通过 Blob URL 方式加载内嵌的 WASM bytes
+4. `build` 脚本编译时内嵌所有代码，生成自包含二进制
 
 #### 3.3.2 pglite-schema.ts（关键修改）
 
@@ -139,10 +167,17 @@ const tsQueryStr = toTsQueryText(tokens);
     "jieba-wasm": "^2.4.0"
   },
   "scripts": {
-    "build": "bun build --compile --outfile bin/gbrain --external jieba-wasm src/cli.ts"
+    "build": "bun build --compile --outfile bin/gbrain src/cli.ts",
+    "build:mac": "bun build --compile --target=bun-darwin-arm64 --outfile bin/gbrain-darwin-arm64 src/cli.ts && bun build --compile --target=bun-darwin-x64 --outfile bin/gbrain-darwin-x64 src/cli.ts",
+    "build:win": "bun build --compile --target=bun-windows-x64 --outfile bin/gbrain-windows-x64.exe src/cli.ts",
+    "build:all": "bun run build:mac && bun run build:win"
   }
 }
 ```
+
+**注意**：
+- 移除了 `--external jieba-wasm`，WASM 文件已内联到代码中
+- 添加了跨平台编译脚本
 
 ---
 
@@ -189,17 +224,48 @@ WHERE COALESCE(segmented_title, '') != '' OR COALESCE(segmented_compiled_truth, 
 ```bash
 cd ~/gbrain
 bun add jieba-wasm
-npm link  # 创建全局链接
 ```
 
-### 5.2 编译
+### 5.2 复制 WASM 文件（自动）
 
+WASM 文件会在构建时自动嵌入到代码中，无需手动复制。
+
+### 5.3 编译
+
+**当前平台：**
 ```bash
 cd ~/gbrain
 bun run build
 ```
 
-### 5.3 数据库更新
+**多平台编译：**
+```bash
+# macOS (arm64 + x64)
+bun run build:mac
+
+# Windows (x64)
+bun run build:win
+
+# 全部平台
+bun run build:all
+```
+
+**输出产物：**
+```
+bin/
+├── gbrain              # 当前平台
+├── gbrain-darwin-arm64 # macOS Apple Silicon
+├── gbrain-darwin-x64   # macOS Intel
+└── gbrain-windows-x64.exe # Windows x64
+```
+
+**跨平台编译注意**：
+- 从 macOS 只能编译 macOS 版本
+- 从 Linux 只能编译 Linux 版本
+- 从 Windows 只能编译 Windows 版本
+- 如需多平台构建，建议使用 CI/CD（如 GitHub Actions）
+
+### 5.4 数据库更新
 
 执行数据库更新脚本（见上方 4.1-4.3）
 
@@ -229,16 +295,71 @@ bun run build
 
 ## 七、已知问题
 
-### 7.1 打包问题
+### 7.1 打包问题（已解决）
 
-jieba-wasm 依赖 WASM 文件（约 4MB），bun compile 打包后无法正常工作。
+jieba-wasm 依赖 WASM 文件（约 4MB），之前 bun compile 打包后无法正常工作。
 
-**解决方案**：使用 `npm link` 让全局命令从项目目录的 node_modules 加载依赖
+**解决方案**：将 WASM 文件 base64 编码内嵌到代码中。
 
-```bash
-cd ~/gbrain
-npm link
+**新增文件**：`scripts/embed-wasm.ts`
+```typescript
+import { readFileSync, writeFileSync } from 'fs';
+
+const wasmPath = './node_modules/jieba-wasm/pkg/web/jieba_rs_wasm_bg.wasm';
+const outputPath = './src/core/jieba-wasm-embedded.ts';
+
+const wasmBuffer = readFileSync(wasmPath);
+const base64 = wasmBuffer.toString('base64');
+
+const content = `export const JIEBA_WASM_BASE64 = "${base64}";
+
+export function getJiebaWasmBytes(): Uint8Array {
+  const binaryString = atob(JIEBA_WASM_BASE64);
+  const bytes = new Uint8Array(binaryString.length);
+  for (let i = 0; i < binaryString.length; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  return bytes;
+}
+`;
+
+writeFileSync(outputPath, content);
 ```
+
+**package.json 修改**：
+```json
+{
+  "scripts": {
+    "prebuild": "bun run scripts/embed-wasm.ts",
+    "build": "bun build --compile --outfile bin/gbrain src/cli.ts"
+  }
+}
+```
+
+**tokenizer.ts 加载方式**：
+```typescript
+import { getJiebaWasmBytes } from './jieba-wasm-embedded';
+
+async function ensureInitialized() {
+  if (!initialized) {
+    const wasmBytes = getJiebaWasmBytes();
+    const blob = new Blob([wasmBytes], { type: 'application/wasm' });
+    const url = URL.createObjectURL(blob);
+    try {
+      await init({ module_or_path: url });
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+    initialized = true;
+  }
+}
+```
+
+**验证**：
+- 二进制大小约 67MB（WASM 内嵌）
+- 不需要 `npm link`
+- 不依赖外部 node_modules
+- 可在任意目录运行
 
 ### 7.2 向量维度
 
@@ -250,6 +371,37 @@ npm link
 
 ## 八、回滚方案
 
+### 8.1 代码回滚
+
+1. 移除生成的嵌入文件：
+```bash
+rm src/core/jieba-wasm-embedded.ts
+rm scripts/embed-wasm.ts  # 如果不再需要
+```
+
+2. 恢复 `src/core/tokenizer.ts`（使用外部依赖）：
+```typescript
+import { cut_for_search } from 'jieba-wasm';
+
+export async function tokenize(text: string): Promise<string[]> {
+  return cut_for_search(text, true)
+    .filter(w => w.trim() && !/^\p{P}+$/u.test(w));
+}
+```
+
+3. 恢复 package.json 的 build 脚本：
+```json
+{
+  "scripts": {
+    "build": "bun build --compile --outfile bin/gbrain --external jieba-wasm src/cli.ts"
+  }
+}
+```
+
+4. 恢复 .gitignore（移除 `src/core/jieba-wasm-embedded.ts`）
+
+### 8.2 数据库回滚
+
 1. 删除新增列：
 ```sql
 ALTER TABLE pages DROP COLUMN IF EXISTS segmented_title;
@@ -258,8 +410,6 @@ ALTER TABLE pages DROP COLUMN IF EXISTS segmented_timeline;
 ```
 
 2. 恢复 trigger 函数（改回 'english'）
-
-3. 移除依赖：`bun remove jieba-wasm`
 
 ---
 
